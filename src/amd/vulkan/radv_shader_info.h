@@ -347,6 +347,9 @@ void gfx10_get_ngg_info(const struct radv_compiler_info *compiler_info, struct r
 void gfx10_ngg_set_esgs_ring_itemsize(struct radv_shader_info *es_info, struct radv_shader_info *gs_info,
                                       struct gfx10_ngg_info *out);
 
+void radv_psbc_set_vs_output_param(enum amd_gfx_level gfx_level, const struct nir_shader *nir,
+                                   const struct radv_graphics_state_key *gfx_state, struct radv_shader_info *info);
+
 void radv_nir_shader_info_link(const struct radv_compiler_info *compiler_info,
                                const struct radv_graphics_state_key *gfx_state, struct radv_shader_stage *stages);
 

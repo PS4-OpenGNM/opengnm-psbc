@@ -1362,6 +1362,15 @@ radv_determine_ngg_settings(const struct radv_compiler_info *compiler_info, stru
    }
 }
 
+/* psbc: standalone VS/TES compilation has no pipeline to link, so param exports
+ * are never assigned and every output except position is dropped */
+void
+radv_psbc_set_vs_output_param(enum amd_gfx_level gfx_level, const struct nir_shader *nir,
+                              const struct radv_graphics_state_key *gfx_state, struct radv_shader_info *info)
+{
+   radv_set_vs_output_param(gfx_level, nir, gfx_state, info, false, false);
+}
+
 static void
 radv_link_shaders_info(const struct radv_compiler_info *compiler_info, struct radv_shader_stage *stages,
                        const struct radv_graphics_state_key *gfx_state)

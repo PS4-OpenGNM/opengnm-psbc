@@ -32,6 +32,7 @@
 #include "radv_shader_info.h"
 #include "radv_aco_shader_info.h"
 #include "radv_pipeline.h"
+#include "radv_descriptor_set.h"
 #include "sid.h"
 
 #include "crc32_sb.h"
@@ -932,6 +933,168 @@ static void setup_target(PsbcTarget target,
     }
 }
 
+/* === Descriptor set layout for standalone compilation ===
+ *
+ * There is no VkPipelineLayout when a shader is compiled alone, and without
+ * one radv lowers every descriptor access to a null descriptor. Build the
+ * layout of descriptor set 0 from the shader's own resource variables with
+ * a fixed rule the runtime can reproduce:
+ *
+ *   - binding N starts at offset N * 64, whatever other bindings the shader
+ *     declares or uses: unused resources are removed while SPIR-V is parsed,
+ *     and variants of one shader must keep the same offsets;
+ *   - only the last binding can be an array longer than 64 bytes;
+ *   - descriptor sizes (per array element):
+ *       uniform/storage buffer, texel buffer   16 (V#)
+ *       sampled/storage image                  32 (T#)
+ *       sampler                                16 (S#)
+ *       combined image sampler                 48 (T# at +0, S# at +32)
+ *
+ * The table address is passed in the 32-bit user SGPR given by the
+ * PTR_INDIRECTRESOURCETABLE input usage slot (address32_hi is 0, so the
+ * table must be below 4 GB). Only descriptor set 0 is supported.
+ */
+#define PSBC_BINDING_STRIDE 64
+#define PSBC_COMBINED_SAMPLER_OFFSET 32
+
+static VkDescriptorType psbc_var_desc_type(const nir_variable* var) {
+    const struct glsl_type* t = glsl_without_array(var->type);
+
+    switch (var->data.mode) {
+    case nir_var_mem_ubo:
+        return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    case nir_var_mem_ssbo:
+        return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    case nir_var_image:
+        return glsl_get_sampler_dim(t) == GLSL_SAMPLER_DIM_BUF
+                   ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+                   : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    case nir_var_uniform:
+        if (glsl_type_is_bare_sampler(t))
+            return VK_DESCRIPTOR_TYPE_SAMPLER;
+        if (glsl_type_is_sampler(t))
+            return glsl_get_sampler_dim(t) == GLSL_SAMPLER_DIM_BUF
+                       ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+                       : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        if (glsl_type_is_texture(t))
+            return glsl_get_sampler_dim(t) == GLSL_SAMPLER_DIM_BUF
+                       ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+                       : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        break;
+    default:
+        break;
+    }
+
+    return VK_DESCRIPTOR_TYPE_MAX_ENUM;
+}
+
+static uint32_t psbc_desc_size(VkDescriptorType type) {
+    switch (type) {
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+        return 32;
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        return 48;
+    default:
+        return 16;
+    }
+}
+
+static const char* psbc_desc_name(VkDescriptorType type) {
+    switch (type) {
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:         return "uniform buffer";
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:         return "storage buffer";
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:   return "uniform texel buffer";
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:   return "storage texel buffer";
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:          return "sampled image";
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:          return "storage image";
+    case VK_DESCRIPTOR_TYPE_SAMPLER:                return "sampler";
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: return "combined image sampler";
+    default:                                        return "unknown";
+    }
+}
+
+/* Returns NULL with PSBC_RESULT_OK in *res when the shader has no resources */
+static struct radv_descriptor_set_layout* psbc_build_set_layout(
+    nir_shader* nir, PsbcResult* res
+) {
+    const nir_variable_mode modes =
+        nir_var_uniform | nir_var_image | nir_var_mem_ubo | nir_var_mem_ssbo;
+    struct radv_descriptor_set_layout* layout;
+    int maxbinding = -1;
+    uint32_t offset = 0;
+
+    *res = PSBC_RESULT_OK;
+
+    nir_foreach_variable_with_modes(var, nir, modes) {
+        if (psbc_var_desc_type(var) == VK_DESCRIPTOR_TYPE_MAX_ENUM)
+            continue;
+        if (var->data.descriptor_set != 0) {
+            fprintf(stderr, "psbc: %s uses descriptor set %u, only set 0 is supported\n",
+                    var->name ? var->name : "resource", var->data.descriptor_set);
+            *res = PSBC_RESULT_COMPILE_NIR;
+            return NULL;
+        }
+        if ((int)var->data.binding > maxbinding)
+            maxbinding = var->data.binding;
+    }
+
+    if (maxbinding < 0)
+        return NULL;
+
+    layout = calloc(1, sizeof(*layout) +
+                           (maxbinding + 1) * sizeof(layout->binding[0]));
+    if (!layout) {
+        *res = PSBC_RESULT_INTERNAL_ERROR;
+        return NULL;
+    }
+    layout->binding_count = maxbinding + 1;
+
+    nir_foreach_variable_with_modes(var, nir, modes) {
+        VkDescriptorType type = psbc_var_desc_type(var);
+        struct radv_descriptor_set_binding_layout* b;
+        uint32_t count;
+
+        if (type == VK_DESCRIPTOR_TYPE_MAX_ENUM)
+            continue;
+
+        b = &layout->binding[var->data.binding];
+        count = MAX2(glsl_get_aoa_size(var->type), 1);
+        if (b->array_size && (b->type != type || b->array_size != count)) {
+            fprintf(stderr, "psbc: binding %u is declared twice with different types\n",
+                    var->data.binding);
+            free(layout);
+            *res = PSBC_RESULT_COMPILE_NIR;
+            return NULL;
+        }
+        b->type = type;
+        b->array_size = count;
+        b->size = psbc_desc_size(type);
+    }
+
+    for (int i = 0; i <= maxbinding; i++) {
+        struct radv_descriptor_set_binding_layout* b = &layout->binding[i];
+
+        if (!b->array_size)
+            continue;
+
+        if (offset > (uint32_t)i * PSBC_BINDING_STRIDE) {
+            fprintf(stderr, "psbc: binding %d overlaps the previous one, only the last binding can be a long array\n", i);
+            free(layout);
+            *res = PSBC_RESULT_COMPILE_NIR;
+            return NULL;
+        }
+        b->offset = i * PSBC_BINDING_STRIDE;
+        offset = b->offset + b->size * b->array_size;
+        fprintf(stderr, "psbc: set 0 binding %d: %s x%u at offset %u, %u bytes each\n",
+                i, psbc_desc_name(b->type), b->array_size, b->offset, b->size);
+    }
+
+    layout->size = offset;
+    fprintf(stderr, "psbc: set 0 size %u bytes\n", layout->size);
+    return layout;
+}
+
 /* === Main compilation function === */
 
 PsbcResult psbc_compile_shader(
@@ -970,6 +1133,10 @@ PsbcResult psbc_compile_shader(
     struct radv_compiler_info compiler_info = {0};
     compiler_info.ac = &ac_info;
     compiler_info.hw.address32_hi = 0;
+    /* descriptor sizes used by the layout above */
+    compiler_info.sampled_image_desc_size = 32;
+    compiler_info.combined_image_sampler_desc_size = 48;
+    compiler_info.combined_image_sampler_offset = PSBC_COMBINED_SAMPLER_OFFSET;
     compiler_info.key.ge_wave_size = 64;
     compiler_info.key.ps_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
     compiler_info.key.cs_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
@@ -1016,6 +1183,17 @@ PsbcResult psbc_compile_shader(
         return PSBC_RESULT_COMPILE_NIR;
     }
 
+    /* Descriptor set layout comes from every declared resource, before the
+     * optimizer removes unused ones: the runtime fills tables by the declared
+     * bindings, so offsets must not depend on what a variant happens to use */
+    PsbcResult layoutres;
+    struct radv_descriptor_set_layout* setlayout =
+        psbc_build_set_layout(nir, &layoutres);
+    if (layoutres != PSBC_RESULT_OK) {
+        psbc_shutdown();
+        return layoutres;
+    }
+
     /* Optimize NIR */
     radv_optimize_nir(nir, !opts->optimise);
 
@@ -1023,19 +1201,38 @@ PsbcResult psbc_compile_shader(
     nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
     radv_nir_lower_io(nir);
 
+    /* Fragment shader inputs get attribute indices in location order, the
+     * same order as VS parameter exports. radv does it when linking; without
+     * it every input has base 0 and all of them read attribute 0. */
+    if (mesa_stage == MESA_SHADER_FRAGMENT)
+        NIR_PASS(_, nir, nir_recompute_io_bases, nir_var_shader_in);
+
     /* Shader info + args + postprocess */
     radv_nir_shader_info_init(stage.stage, stage.next_stage, &stage.info);
 
-    struct radv_shader_layout layout = {0};
+    if (setlayout) {
+        stage.layout.num_sets = 1;
+        stage.layout.set[0].layout = setlayout;
+    }
+
     struct radv_graphics_state_key gfx_state = {0};
     gfx_state.ps.epilog.spi_shader_col_format = V_028714_SPI_SHADER_FP16_ABGR;
     gfx_state.ps.epilog.color_is_int8 = 0xff;
     gfx_state.ps.has_epilog = false;
 
     radv_nir_shader_info_pass(
-        &compiler_info, nir, &layout, &stage.key, &gfx_state,
+        &compiler_info, nir, &stage.layout, &stage.key, &gfx_state,
         RADV_PIPELINE_GRAPHICS, false, &stage.info
     );
+
+    /* Assign parameter exports of the last pre-rasterization stage, normally
+     * done when radv links the pipeline. Without it param_exports is 0 and all
+     * VS outputs except position are removed. Only legacy VS/TES (GFX7-9):
+     * GS outputs go through the copy shader the runtime makes. */
+    if ((mesa_stage == MESA_SHADER_VERTEX && !stage.info.vs.as_es && !stage.info.vs.as_ls) ||
+        (mesa_stage == MESA_SHADER_TESS_EVAL && !stage.info.tes.as_es)) {
+        radv_psbc_set_vs_output_param(gfxlevel, nir, &gfx_state, &stage.info);
+    }
 
     /* Determine previous stage for shader args declaration.
      * HS/GS need previous_stage=VERTEX so that the merged-pipeline args
@@ -1094,6 +1291,7 @@ PsbcResult psbc_compile_shader(
     );
 
     if (!binary) {
+        free(setlayout);
         psbc_shutdown();
         return PSBC_RESULT_COMPILE_ACO;
     }
@@ -1131,6 +1329,7 @@ PsbcResult psbc_compile_shader(
     out->size = output_size;
 
     free(binary);
+    free(setlayout);
     psbc_shutdown();
 
     return result;
