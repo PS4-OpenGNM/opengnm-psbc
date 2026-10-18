@@ -879,27 +879,31 @@ static void setup_ac_info(struct ac_compiler_info* ac_info, enum amd_gfx_level g
         ac_info->wave64_vgpr_alloc_granularity = 4;
         ac_info->has_packed_math_16bit = true;
     } else if (gfxlevel == GFX8) {
+        /* same limits as ac_fill_compiler_info() in Mesa for GFX8 */
         ac_info->max_waves_per_simd = 10;
-        ac_info->num_physical_sgprs_per_simd = 16 * 10;
-        ac_info->num_physical_wave64_vgprs_per_simd = 128;
-        ac_info->num_simd_per_compute_unit = 1;
-        ac_info->min_sgpr_alloc = 1;
-        ac_info->max_sgpr_alloc = 16;
-        ac_info->sgpr_alloc_granularity = 1;
+        ac_info->num_physical_sgprs_per_simd = 800;
+        ac_info->num_physical_wave64_vgprs_per_simd = 256;
+        ac_info->num_simd_per_compute_unit = 4;
+        ac_info->min_sgpr_alloc = 16;
+        ac_info->max_sgpr_alloc = 102;
+        ac_info->sgpr_alloc_granularity = 16;
         ac_info->min_wave64_vgpr_alloc = 4;
-        ac_info->max_vgpr_alloc = 128;
+        ac_info->max_vgpr_alloc = 256;
         ac_info->wave64_vgpr_alloc_granularity = 4;
     } else {
         /* GFX7 */
+        /* same limits as ac_fill_compiler_info() in Mesa for GFX7, the old
+         * values (12 SGPRs, 64 VGPRs) made any shader with a texture fail
+         * register allocation */
         ac_info->max_waves_per_simd = 10;
-        ac_info->num_physical_sgprs_per_simd = 12 * 10;
-        ac_info->num_physical_wave64_vgprs_per_simd = 64;
-        ac_info->num_simd_per_compute_unit = 1;
-        ac_info->min_sgpr_alloc = 1;
-        ac_info->max_sgpr_alloc = 12;
-        ac_info->sgpr_alloc_granularity = 1;
+        ac_info->num_physical_sgprs_per_simd = 512;
+        ac_info->num_physical_wave64_vgprs_per_simd = 256;
+        ac_info->num_simd_per_compute_unit = 4;
+        ac_info->min_sgpr_alloc = 8;
+        ac_info->max_sgpr_alloc = 104;
+        ac_info->sgpr_alloc_granularity = 8;
         ac_info->min_wave64_vgpr_alloc = 4;
-        ac_info->max_vgpr_alloc = 64;
+        ac_info->max_vgpr_alloc = 256;
         ac_info->wave64_vgpr_alloc_granularity = 4;
     }
 }
