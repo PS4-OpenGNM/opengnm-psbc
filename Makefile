@@ -225,12 +225,17 @@ UTIL_SRCS = $(filter-out \
 # Mesa util format sources
 UTIL_FORMAT_SRCS = $(wildcard src/util/format/*.c)
 
-# Blake3 hashing — need dispatch + portable + neon (ARM64)
+# Blake3 hashing — need dispatch + portable, plus neon on ARM64 hosts
 BLAKE3_SRCS = \
 	src/util/blake3/blake3.c \
 	src/util/blake3/blake3_dispatch.c \
-	src/util/blake3/blake3_portable.c \
-	src/util/blake3/blake3_neon.c
+	src/util/blake3/blake3_portable.c
+
+# blake3_neon.c needs ARM intrinsics, don't build it on x86
+BLAKE3_HOST_ARCH ?= $(shell uname -m)
+ifneq ($(filter aarch64 arm64 armv8%,$(BLAKE3_HOST_ARCH)),)
+BLAKE3_SRCS += src/util/blake3/blake3_neon.c
+endif
 
 # C11 threads compat (POSIX implementation)
 C11_THREADS_SRCS = src/c11/impl/threads_posix.c src/c11/impl/time.c
